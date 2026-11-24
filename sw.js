@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION whenever you change any file.
-const VERSION = 'replay-cam-v1';
+const VERSION = 'replay-cam-v2';
 const FILES = [
   './', './index.html', './app.js', './audio-tap.js', './mp4-muxer.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',

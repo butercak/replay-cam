@@ -39,11 +39,14 @@
   #preview { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
   #preview.mirror { transform: scaleX(-1); }
 
-  .topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px;
+  .topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; align-items: flex-start; gap: 8px;
     padding: calc(var(--safe-t) + 10px) calc(var(--safe-r) + 12px) 10px calc(var(--safe-l) + 12px);
     background: linear-gradient(#000a, #0000); z-index: 5; }
-  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px;
-    background: #000a; border: 1px solid #ffffff22; font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .status { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+  .tools { flex: none; display: flex; gap: 8px; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; max-width: 100%;
+    background: #000a; border: 1px solid #ffffff22; font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill.sub { padding: 4px 10px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.live { background: var(--accent); animation: blink 1.4s infinite; }
   @keyframes blink { 50% { opacity: .35; } }
@@ -57,16 +60,34 @@
 
   .bottombar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; display: flex; flex-direction: column; align-items: center;
     gap: 8px; padding: 16px 16px calc(var(--safe-b) + 18px); background: linear-gradient(#0000, #000b); }
-  #saveBtn { width: 84px; height: 84px; border-radius: 50%; border: 4px solid #fff; background: var(--accent);
+  .controls { display: flex; align-items: center; gap: 30px; }
+  #saveBtn, #goBtn { width: 84px; height: 84px; border-radius: 50%; border: 4px solid #fff; background: var(--accent);
     box-shadow: 0 0 0 4px #0006; display: grid; place-items: center; transition: transform .1s; }
-  #saveBtn:active { transform: scale(.93); }
+  #goBtn { background: #0000; }
+  #goBtn span { width: 58px; height: 58px; border-radius: 50%; background: var(--accent); }
+  #saveBtn:active, #goBtn:active, .side-btn:active { transform: scale(.93); }
   #saveBtn:disabled { opacity: .45; }
   #saveBtn svg { width: 34px; height: 34px; }
-  #saveLabel { font-size: 14px; text-shadow: 0 1px 3px #000; }
+  .side-btn { width: 52px; height: 52px; border-radius: 50%; border: 1px solid #ffffff33; background: #000a;
+    display: grid; place-items: center; padding: 0; transition: transform .1s; }
+  .side-btn svg { width: 22px; height: 22px; }
+  #saveLabel { font-size: 14px; text-shadow: 0 1px 3px #000; text-align: center; }
+  body:not(.running) .controls, body:not(.running) #memText { display: none; }
+  body.running #goBtn, body.running #idle { display: none; }
+
+  #idle { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    padding: 120px 28px 170px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; pointer-events: none; }
+  #idle b { color: var(--text); font-size: 20px; }
+
+  #dim { position: fixed; inset: 0; z-index: 6; background: #000; opacity: .97; display: none;
+    align-items: flex-start; justify-content: center; padding-top: calc(var(--safe-t) + 24px); color: #555; font-size: 13px; }
+  body.dimmed #dim { display: flex; }
+  body.dimmed .bottombar { z-index: 7; background: none; opacity: .5; }
 
   @media (orientation: landscape) and (max-height: 560px) {
     .bottombar { left: auto; top: 0; width: auto; justify-content: center; background: linear-gradient(90deg, #0000, #000b);
       padding: 16px calc(var(--safe-r) + 18px) 16px 24px; }
+    .controls { flex-direction: column; gap: 18px; }
   }
 
   .overlay { position: fixed; inset: 0; z-index: 20; background: #000e; display: flex; align-items: center; justify-content: center;
@@ -115,9 +136,11 @@
 <div id="flash"></div>
 
 <div class="topbar">
-  <span class="pill"><span class="dot" id="liveDot"></span><span id="bufText">未啟動</span></span>
-  <span class="pill sub" id="memText" hidden></span>
-  <span class="spacer"></span>
+  <div class="status">
+    <span class="pill"><span class="dot" id="liveDot"></span><span id="bufText">待機中</span></span>
+    <span class="pill sub" id="memText" hidden></span>
+  </div>
+  <div class="tools">
   <button class="icon-btn" id="flipBtn" aria-label="切換鏡頭">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h3l2-3h8l2 3h3v12H3z"/><path d="M9 13a3 3 0 0 1 5.2-2M15 13a3 3 0 0 1-5.2 2"/><path d="M14.5 9.5v1.7h-1.7M9.5 16.5v-1.7h1.7"/></svg>
   </button>
@@ -128,23 +151,40 @@
   <button class="icon-btn" id="settingsBtn" aria-label="設定">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
   </button>
+  </div>
 </div>
+
+<div id="idle">
+  <b>回放相機</b>
+  <div id="idleMsg">按下面的紅色按鈕開始。開始後才會開相機，並一直保留最近 X 分鐘的畫面。<br>打完一首按「保存」，不用了就按「停止」省電。</div>
+</div>
+
+<div id="dim">省電黑屏中 ・ 點一下恢復畫面（仍在緩衝）</div>
 
 <div class="bottombar">
-  <button id="saveBtn" aria-label="保存回放" disabled>
-    <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>
-  </button>
-  <div id="saveLabel">保存過去 2 分鐘</div>
+  <button id="goBtn" aria-label="開始"><span></span></button>
+  <div class="controls">
+    <button class="side-btn" id="stopBtn" aria-label="停止">
+      <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="#fff"/></svg>
+    </button>
+    <button id="saveBtn" aria-label="保存回放" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>
+    </button>
+    <button class="side-btn" id="dimBtn" aria-label="省電黑屏">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+    </button>
+  </div>
+  <div id="saveLabel">按下開始</div>
 </div>
 
-<!-- start / error overlay -->
-<div class="overlay" id="startOverlay">
+<!-- error overlay -->
+<div class="overlay" id="startOverlay" style="display:none">
   <div class="card">
     <h1>回放相機</h1>
     <p>相機開著的時候會在背景一直錄，但只保留<b>最近 X 分鐘</b>。打完一首歌按「保存」，就會把剛剛那段存成 MP4。</p>
     <p>錄影期間請讓這個畫面保持在前景，手機不要鎖定或切到別的 App，否則相機會被系統關掉。</p>
     <p id="startMsg" class="err" hidden></p>
-    <button class="primary" id="startBtn">開啟相機</button>
+    <button class="primary" id="startBtn">重新開始</button>
   </div>
 </div>
 

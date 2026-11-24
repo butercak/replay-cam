@@ -108,12 +108,14 @@ async function startSession() {
     const vt = sess.stream.getVideoTracks()[0];
     const vs = vt.getSettings ? vt.getSettings() : {};
     sess.trackFps = vs.frameRate || Number(S.fps);
-    vt.addEventListener('ended', () => { if (cur === sess) { stopSession(sess); showStart('相機被系統關閉了（可能是切到別的 App 或鎖定螢幕），點下面重新開啟。'); } });
+    vt.addEventListener('ended', () => { if (cur === sess) { stopSession(sess); setIdleMsg('相機被系統關閉了（可能是切到別的 App 或鎖定螢幕）。按紅色按鈕重新開始。'); } });
 
     await setupAudio(sess);
     if (!sess.alive) return;
     video.requestVideoFrameCallback((n, m) => onFrame(sess, n, m));
     hideStart();
+    document.body.classList.add('running');
+    $('#saveLabel').textContent = `保存過去 ${minutesLabel()}`;
     requestWakeLock();
   } catch (e) {
     console.error(e);
@@ -136,7 +138,27 @@ function stopSession(sess) {
   try { sess.ctx && sess.ctx.close(); } catch {}
   sess.v = []; sess.a = []; sess.pcm = [];
   if (video.srcObject === sess.stream) video.srcObject = null;
-  if (cur === sess) { setSaveEnabled(false); $('#bufText').textContent = '未啟動'; $('#liveDot').classList.remove('live'); }
+  if (cur === sess) {
+    setSaveEnabled(false);
+    $('#bufText').textContent = '待機中';
+    $('#liveDot').classList.remove('live');
+    document.body.classList.remove('running', 'dimmed');
+    $('#saveLabel').textContent = '按下開始';
+    releaseWakeLock();
+  }
+}
+
+function setIdleMsg(msg) { $('#idleMsg').textContent = msg; }
+
+let lastSaveAt = 0;
+function stopByUser() {
+  const s = cur;
+  if (!s || !s.alive) return;
+  const buffered = s.v.length ? (s.v[s.v.length - 1].ts - s.v[0].ts) / 1e6 : 0;
+  // Guard against losing a good take: ask only if there is unsaved footage.
+  if (buffered > 10 && Date.now() - lastSaveAt > 30000 && !confirm('停止後，還沒保存的回放畫面會被清掉。確定要停止嗎？')) return;
+  stopSession(s);
+  setIdleMsg('已停止，相機已關閉。按紅色按鈕重新開始。');
 }
 
 // ---------- video ----------
@@ -457,13 +479,14 @@ async function saveClip() {
       clip.wav = { name: `replay_${stamp}.wav`, blob: makeWav(sess.pcm.slice(), sess.sr, sess.ch, t0 - off, tEnd - off) };
     }
     addClip(clip);
+    lastSaveAt = Date.now();
     toast(`已保存 ${fmtTime(clip.dur)}，點右上角影片圖示存到相簿`);
   } catch (e) {
     console.error(e);
     toast('保存失敗：' + (e && e.message ? e.message : e), 5000);
   } finally {
     saving = false;
-    $('#saveLabel').textContent = `保存過去 ${minutesLabel()}`;
+    $('#saveLabel').textContent = cur && cur.alive ? `保存過去 ${minutesLabel()}` : '按下開始';
     if (cur && cur.alive && cur.vMeta) setSaveEnabled(true);
   }
 }
@@ -568,6 +591,10 @@ async function requestWakeLock() {
     }
   } catch (e) { console.warn('wakeLock', e); }
 }
+function releaseWakeLock() {
+  try { wakeLock && wakeLock.release(); } catch {}
+  wakeLock = null;
+}
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (cur && cur.alive) {
@@ -575,7 +602,7 @@ document.addEventListener('visibilitychange', () => {
     if (video.paused) video.play().catch(() => {});
     if (cur.ctx && cur.ctx.state !== 'running') cur.ctx.resume().catch(() => {});
     const vt = cur.stream && cur.stream.getVideoTracks()[0];
-    if (vt && vt.readyState === 'ended') { stopSession(cur); showStart('相機被系統關閉了，點下面重新開啟。'); }
+    if (vt && vt.readyState === 'ended') { stopSession(cur); setIdleMsg('相機被系統關閉了（可能是切到別的 App 或鎖定螢幕）。按紅色按鈕重新開始。'); }
   }
 });
 
@@ -612,8 +639,7 @@ $('#applyBtn').addEventListener('click', () => {
   S.offsetMs = Math.max(-1000, Math.min(1000, Number($('#sOffset').value) || 0));
   S.rawAudio = $('#sRawAudio').checked;
   saveSettings(); closeSheets();
-  $('#saveLabel').textContent = `保存過去 ${minutesLabel()}`;
-  startSession();
+  if (cur && cur.alive) startSession(); else toast('設定已儲存');
 });
 // Offset can change without restarting: it is applied at save time.
 $('#sOffset').addEventListener('change', () => {
@@ -622,12 +648,18 @@ $('#sOffset').addEventListener('change', () => {
 
 // ---------- buttons ----------
 $('#startBtn').addEventListener('click', () => startSession());
+$('#goBtn').addEventListener('click', () => startSession());
+$('#stopBtn').addEventListener('click', () => stopByUser());
 $('#saveBtn').addEventListener('click', () => saveClip());
+// Power saver: cover the preview with (almost) black. Recording continues underneath.
+$('#dimBtn').addEventListener('click', () => document.body.classList.add('dimmed'));
+$('#dim').addEventListener('click', () => document.body.classList.remove('dimmed'));
 $('#settingsBtn').addEventListener('click', () => { fillSettings(); openSheet('#settingsSheet'); });
 $('#clipsBtn').addEventListener('click', () => { renderClips(); openSheet('#clipsSheet'); });
 $('#flipBtn').addEventListener('click', () => {
   S.facing = S.facing === 'user' ? 'environment' : 'user'; saveSettings();
   if (cur && cur.alive) startSession();
+  else toast(S.facing === 'user' ? '已切換成前鏡頭' : '已切換成後鏡頭');
 });
 // Bluetooth shutter remotes / keyboards: Space, Enter or Volume Up saves.
 document.addEventListener('keydown', (e) => {
@@ -666,11 +698,10 @@ function demoStream(sess) {
 }
 
 // ---------- init ----------
-$('#saveLabel').textContent = `保存過去 ${minutesLabel()}`;
 renderClips();
 {
   const why = unsupportedReason();
-  if (why) { showStart(why); $('#startBtn').disabled = true; }
+  if (why) { showStart(why); $('#startBtn').disabled = true; $('#goBtn').disabled = true; setIdleMsg(why); }
 }
 if ('serviceWorker' in navigator && !DEMO) {
   navigator.serviceWorker.register('sw.js').catch((e) => console.warn('sw', e));
