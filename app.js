@@ -67,17 +67,31 @@ function constraints() {
   const h = Number(S.res), w = Math.round(h * 16 / 9);
   const fps = Number(S.fps);
   const raw = !!S.rawAudio;
+  const video = {
+    facingMode: { ideal: S.facing },
+    width: { ideal: w }, height: { ideal: h },
+    frameRate: { ideal: fps, max: fps },
+  };
+  // Chromium only exposes zoom if it is requested up front.
+  const sup = navigator.mediaDevices.getSupportedConstraints ? navigator.mediaDevices.getSupportedConstraints() : {};
+  if ('userAgentData' in navigator && sup.zoom) video.zoom = true;
   return {
-    video: {
-      facingMode: { ideal: S.facing },
-      width: { ideal: w }, height: { ideal: h },
-      frameRate: { ideal: fps, max: fps },
-    },
+    video,
     audio: {
       echoCancellation: !raw, noiseSuppression: !raw, autoGainControl: !raw,
       channelCount: { ideal: 2 },
     },
   };
+}
+
+async function getCamera() {
+  const c = constraints();
+  try { return await navigator.mediaDevices.getUserMedia(c); }
+  catch (e) {
+    if (!c.video.zoom || e.name === 'NotAllowedError') throw e;
+    delete c.video.zoom; // retry without the zoom permission request
+    return await navigator.mediaDevices.getUserMedia(c);
+  }
 }
 
 async function startSession() {
@@ -100,7 +114,7 @@ async function startSession() {
 
   try {
     ctx.resume().catch(() => {});
-    sess.stream = DEMO ? demoStream(sess) : await navigator.mediaDevices.getUserMedia(constraints());
+    sess.stream = DEMO ? demoStream(sess) : await getCamera();
     if (!sess.alive) return;
     video.srcObject = sess.stream;
     video.classList.toggle('mirror', S.facing === 'user' && !DEMO);
@@ -571,7 +585,7 @@ setInterval(() => {
   $('#liveDot').classList.toggle('live', live);
   if (live) {
     const have = Math.min((s.v[s.v.length - 1].ts - s.v[0].ts) / 1e6, bufUs() / 1e6);
-    $('#bufText').textContent = `回放 ${fmtTime(have)} / ${fmtTime(bufUs() / 1e6)}`;
+    $('#bufText').textContent = `${fmtTime(have)} / ${fmtTime(bufUs() / 1e6)}`;
   } else {
     $('#bufText').textContent = '準備中…';
   }
@@ -646,7 +660,257 @@ $('#sOffset').addEventListener('change', () => {
   S.offsetMs = Math.max(-1000, Math.min(1000, Number($('#sOffset').value) || 0)); saveSettings();
 });
 
+// ---------- camera controls (focus / exposure / white balance / zoom / torch) ----------
+function vTrack() { return cur && cur.alive && cur.stream ? cur.stream.getVideoTracks()[0] : null; }
+function camCaps(t) { try { return t.getCapabilities ? t.getCapabilities() : {}; } catch { return {}; } }
+function camSettings(t) { try { return t.getSettings(); } catch { return {}; } }
+const isRange = (v) => v && typeof v === 'object' && !Array.isArray(v) && Number.isFinite(v.min) && Number.isFinite(v.max) && v.max > v.min;
+const modesOf = (caps, k) => (Array.isArray(caps[k]) ? caps[k] : []);
+
+// Apply constraints and check that string/boolean values actually took effect
+// (unsatisfiable "advanced" constraints are silently ignored by browsers).
+async function applyCam(c, quiet) {
+  const t = vTrack();
+  if (!t) return false;
+  const took = () => {
+    const s = camSettings(t);
+    return Object.keys(c).every((k) => typeof c[k] !== 'string' && typeof c[k] !== 'boolean' ? true : s[k] === undefined || s[k] === c[k]);
+  };
+  try { await t.applyConstraints({ advanced: [c] }); if (took()) return true; } catch (e) { console.warn('advanced', e); }
+  try {
+    const exact = {};
+    for (const k of Object.keys(c)) exact[k] = (typeof c[k] === 'object') ? c[k] : { exact: c[k] };
+    await t.applyConstraints(exact);
+    if (took()) return true;
+  } catch (e) { console.warn('exact', e); }
+  if (!quiet) toast('這支手機沒有套用這個設定');
+  return false;
+}
+
+function fmtShutter(v100us) { // exposureTime is in units of 100 µs
+  const s = v100us / 1e4;
+  return s >= 0.5 ? s.toFixed(1) + ' 秒' : '1/' + Math.round(1 / s) + ' 秒';
+}
+const round = (v, step) => (step ? Math.round(v / step) * step : v);
+
+function camRow(label, hint) {
+  const row = document.createElement('div'); row.className = 'row';
+  const l = document.createElement('label'); l.textContent = label;
+  if (hint) { const sm = document.createElement('small'); sm.textContent = hint; l.appendChild(sm); }
+  row.appendChild(l);
+  return row;
+}
+function camToggle(box, label, hint, checked, onChange) {
+  const row = camRow(label, hint);
+  const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!checked;
+  cb.onchange = async () => { cb.disabled = true; await onChange(cb.checked); cb.disabled = false; refreshCamPanel(); };
+  row.appendChild(cb); box.appendChild(row);
+  return cb;
+}
+function camSlider(box, label, range, value, fmt, onCommit) {
+  const row = document.createElement('div'); row.className = 'row col';
+  const top = document.createElement('div'); top.className = 'top';
+  const l = document.createElement('label'); l.textContent = label;
+  const val = document.createElement('span'); val.className = 'val';
+  top.append(l, val);
+  const inp = document.createElement('input'); inp.type = 'range';
+  inp.min = range.min; inp.max = range.max; inp.step = range.step || (range.max - range.min) / 100;
+  inp.value = Number.isFinite(value) ? value : range.min;
+  val.textContent = fmt(Number(inp.value));
+  let busy = false, pending = null;
+  const send = async () => {
+    if (busy) return; busy = true;
+    while (pending !== null) { const v = pending; pending = null; await onCommit(v); }
+    busy = false;
+  };
+  inp.oninput = () => { val.textContent = fmt(Number(inp.value)); pending = Number(inp.value); send(); };
+  row.append(top, inp); box.appendChild(row);
+}
+function camSection(box, title) { const d = document.createElement('div'); d.className = 'sec'; d.textContent = title; box.appendChild(d); }
+
+function refreshCamPanel() { if ($('#camSheet').classList.contains('open')) buildCamPanel(); }
+
+function buildCamPanel() {
+  const box = $('#camControls');
+  box.textContent = '';
+  const t = vTrack();
+  if (!t) { box.innerHTML = '<div class="empty">先按開始，開啟相機後才能調整。</div>'; return; }
+  const caps = camCaps(t), set = camSettings(t);
+  let shown = 0;
+
+  // Focus
+  const fModes = modesOf(caps, 'focusMode');
+  const canLockF = fModes.includes('manual') || fModes.includes('single-shot');
+  if (canLockF || isRange(caps.focusDistance)) {
+    camSection(box, '對焦'); shown++;
+    if (canLockF) {
+      camToggle(box, '鎖定對焦', '鎖在現在對到的位置，手指晃過去也不會重新對焦', set.focusMode && set.focusMode !== 'continuous', async (on) => {
+        if (!on) return applyCam({ focusMode: 'continuous' });
+        const s = camSettings(t);
+        if (fModes.includes('manual') && Number.isFinite(s.focusDistance)) return applyCam({ focusMode: 'manual', focusDistance: s.focusDistance });
+        return applyCam({ focusMode: fModes.includes('single-shot') ? 'single-shot' : 'manual' });
+      });
+    }
+    if (isRange(caps.focusDistance) && fModes.includes('manual')) {
+      const r = caps.focusDistance;
+      camSlider(box, '對焦距離（手動）', r, set.focusDistance, (v) => v.toFixed(2), (v) => applyCam({ focusMode: 'manual', focusDistance: v }, true));
+    }
+  }
+
+  // Exposure
+  const eModes = modesOf(caps, 'exposureMode');
+  const canLockE = eModes.includes('manual') || eModes.includes('single-shot');
+  const hasShutter = isRange(caps.exposureTime) && eModes.includes('manual');
+  const hasIso = isRange(caps.iso) && eModes.includes('manual');
+  if (canLockE || isRange(caps.exposureCompensation) || hasShutter) {
+    camSection(box, '曝光'); shown++;
+    if (canLockE) {
+      camToggle(box, '鎖定曝光', '螢幕閃爍時亮度不會一直跳', set.exposureMode && set.exposureMode !== 'continuous', async (on) => {
+        if (!on) return applyCam({ exposureMode: 'continuous' });
+        const s = camSettings(t);
+        if (eModes.includes('manual') && Number.isFinite(s.exposureTime)) {
+          const c = { exposureMode: 'manual', exposureTime: s.exposureTime };
+          if (Number.isFinite(s.iso)) c.iso = s.iso;
+          return applyCam(c);
+        }
+        return applyCam({ exposureMode: eModes.includes('single-shot') ? 'single-shot' : 'manual' });
+      });
+    }
+    if (isRange(caps.exposureCompensation)) {
+      camSlider(box, '曝光補償（自動曝光時）', caps.exposureCompensation, set.exposureCompensation ?? 0,
+        (v) => (Math.abs(v) < 0.05 ? '0.0' : (v > 0 ? '+' : '') + v.toFixed(1)) + ' EV', (v) => applyCam({ exposureCompensation: round(v, caps.exposureCompensation.step) }, true));
+    }
+    if (hasShutter) {
+      const r = caps.exposureTime;
+      const row = camRow('快門速度', '越快手指越不會糊，但畫面會變暗');
+      const sel = document.createElement('select');
+      sel.add(new Option('自動', 'auto'));
+      for (const den of [30, 60, 120, 250, 500, 1000, 2000]) {
+        const v = 1e4 / den;
+        if (v >= r.min && v <= r.max) sel.add(new Option('1/' + den + ' 秒', String(v)));
+      }
+      sel.value = set.exposureMode === 'manual' && Number.isFinite(set.exposureTime)
+        ? ([...sel.options].find((o) => o.value !== 'auto' && Math.abs(Number(o.value) - set.exposureTime) / set.exposureTime < 0.08) || { value: 'auto' }).value
+        : 'auto';
+      if (sel.value === 'auto' && set.exposureMode === 'manual' && Number.isFinite(set.exposureTime)) {
+        sel.add(new Option(fmtShutter(set.exposureTime) + '（目前）', 'cur')); sel.value = 'cur';
+      }
+      sel.onchange = async () => {
+        if (sel.value === 'cur') return;
+        if (sel.value === 'auto') await applyCam({ exposureMode: 'continuous' });
+        else {
+          const c = { exposureMode: 'manual', exposureTime: Number(sel.value) };
+          const s = camSettings(t);
+          if (Number.isFinite(s.iso)) c.iso = s.iso;
+          await applyCam(c);
+        }
+        refreshCamPanel();
+      };
+      row.appendChild(sel); box.appendChild(row);
+    }
+    if (hasIso) {
+      camSlider(box, 'ISO（手動曝光時）', caps.iso, set.iso, (v) => String(Math.round(v)), (v) => {
+        const s = camSettings(t);
+        const c = { exposureMode: 'manual', iso: round(v, caps.iso.step) };
+        if (Number.isFinite(s.exposureTime)) c.exposureTime = s.exposureTime;
+        return applyCam(c, true);
+      });
+    }
+  }
+
+  // White balance
+  const wModes = modesOf(caps, 'whiteBalanceMode');
+  const canLockW = wModes.includes('manual') || wModes.includes('single-shot');
+  if (canLockW || isRange(caps.colorTemperature)) {
+    camSection(box, '白平衡'); shown++;
+    if (canLockW) {
+      camToggle(box, '鎖定白平衡', '螢幕顏色變化時，畫面色調不會跟著飄', set.whiteBalanceMode && set.whiteBalanceMode !== 'continuous', async (on) => {
+        if (!on) return applyCam({ whiteBalanceMode: 'continuous' });
+        const s = camSettings(t);
+        if (wModes.includes('manual') && Number.isFinite(s.colorTemperature)) return applyCam({ whiteBalanceMode: 'manual', colorTemperature: s.colorTemperature });
+        return applyCam({ whiteBalanceMode: wModes.includes('single-shot') ? 'single-shot' : 'manual' });
+      });
+    }
+    if (isRange(caps.colorTemperature) && wModes.includes('manual')) {
+      camSlider(box, '色溫（手動）', caps.colorTemperature, set.colorTemperature, (v) => Math.round(v) + ' K',
+        (v) => applyCam({ whiteBalanceMode: 'manual', colorTemperature: round(v, caps.colorTemperature.step) }, true));
+    }
+  }
+
+  // Zoom / torch
+  const hasTorch = caps.torch === true || (Array.isArray(caps.torch) && caps.torch.includes(true));
+  if (isRange(caps.zoom) || hasTorch) {
+    camSection(box, '其他'); shown++;
+    if (isRange(caps.zoom)) {
+      camSlider(box, '變焦', caps.zoom, set.zoom, (v) => v.toFixed(1) + '×', (v) => applyCam({ zoom: round(v, caps.zoom.step) }, true));
+    }
+    if (hasTorch) camToggle(box, '補光燈', '', !!set.torch, (on) => applyCam({ torch: on }));
+  }
+
+  if (!shown) {
+    box.innerHTML = '<div class="empty">這支手機的瀏覽器沒有開放任何鏡頭控制。<br>（iPhone 的 Safari 常常是這樣，只能靠原生 App 才能鎖對焦／曝光。）</div>';
+  }
+  $('#camReset').hidden = !shown;
+
+  // Capability report
+  const yes = (b) => (b ? '✅' : '—');
+  $('#camCaps').innerHTML = '';
+  const lines = [
+    ['鎖定對焦', canLockF], ['手動對焦距離', isRange(caps.focusDistance) && fModes.includes('manual')],
+    ['鎖定曝光', canLockE], ['曝光補償', isRange(caps.exposureCompensation)], ['手動快門', hasShutter], ['手動 ISO', hasIso],
+    ['鎖定白平衡', canLockW], ['手動色溫', isRange(caps.colorTemperature) && wModes.includes('manual')],
+    ['變焦', isRange(caps.zoom)], ['補光燈', hasTorch], ['點畫面對焦', tapFocusSupported(caps)],
+  ];
+  const ul = document.createElement('div');
+  ul.textContent = lines.map(([n, b]) => `${yes(b)} ${n}`).join('　');
+  ul.style.lineHeight = '1.9';
+  $('#camCaps').appendChild(ul);
+  $('#camRaw').textContent = 'capabilities: ' + JSON.stringify(caps) + '\n\nsettings: ' + JSON.stringify(set) + '\n\n' + navigator.userAgent;
+}
+
+$('#camReset').addEventListener('click', async () => {
+  const t = vTrack(); if (!t) return;
+  const caps = camCaps(t), c = {};
+  if (modesOf(caps, 'focusMode').includes('continuous')) c.focusMode = 'continuous';
+  if (modesOf(caps, 'exposureMode').includes('continuous')) c.exposureMode = 'continuous';
+  if (modesOf(caps, 'whiteBalanceMode').includes('continuous')) c.whiteBalanceMode = 'continuous';
+  if (isRange(caps.exposureCompensation)) c.exposureCompensation = 0;
+  if (Object.keys(c).length) await applyCam(c);
+  toast('已恢復自動');
+  refreshCamPanel();
+});
+
+// Tap on the preview to focus / meter at that point (Android Chrome).
+function tapFocusSupported(caps) {
+  const sup = navigator.mediaDevices.getSupportedConstraints ? navigator.mediaDevices.getSupportedConstraints() : {};
+  return !!sup.pointsOfInterest && (modesOf(caps, 'focusMode').length > 0 || modesOf(caps, 'exposureMode').length > 0);
+}
+video.addEventListener('click', async (e) => {
+  const t = vTrack();
+  if (!t || document.body.classList.contains('dimmed')) return;
+  const caps = camCaps(t);
+  if (!tapFocusSupported(caps)) return;
+  // Map the tap into the video frame (object-fit: contain, maybe mirrored).
+  const r = video.getBoundingClientRect(), vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const dw = vw * scale, dh = vh * scale, ox = r.left + (r.width - dw) / 2, oy = r.top + (r.height - dh) / 2;
+  let x = (e.clientX - ox) / dw, y = (e.clientY - oy) / dh;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  if (video.classList.contains('mirror')) x = 1 - x;
+  const ring = $('#focusRing');
+  ring.style.left = e.clientX + 'px'; ring.style.top = e.clientY + 'px';
+  ring.classList.add('show'); setTimeout(() => ring.classList.remove('show'), 900);
+  const c = { pointsOfInterest: [{ x, y }] };
+  const f = modesOf(caps, 'focusMode'), ex = modesOf(caps, 'exposureMode');
+  if (f.includes('single-shot')) c.focusMode = 'single-shot'; else if (f.includes('continuous')) c.focusMode = 'continuous';
+  if (ex.includes('continuous')) c.exposureMode = 'continuous';
+  await applyCam(c, true);
+  refreshCamPanel();
+});
+
 // ---------- buttons ----------
+$('#camBtn').addEventListener('click', () => { buildCamPanel(); openSheet('#camSheet'); });
 $('#startBtn').addEventListener('click', () => startSession());
 $('#goBtn').addEventListener('click', () => startSession());
 $('#stopBtn').addEventListener('click', () => stopByUser());
